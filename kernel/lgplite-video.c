@@ -4,6 +4,7 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
@@ -11,9 +12,17 @@
 
 #include "lgplite.h"
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
+#define min_queued_buffers min_buffers_needed
+#endif
+
+/* The encoder scales its input down. All sizes keep the 16:9 aspect of the
+ * supported HDMI modes; a 4:3 size would be stretched, not cropped.
+ */
 static const struct v4l2_frmsize_discrete sizes[] = {
-	{ 640, 480 }, { 1280, 720 }, { 1920, 1080 },
+	{ 640, 360 }, { 960, 540 }, { 1280, 720 }, { 1920, 1080 },
 };
+
 static const unsigned int rates[] = { 30, 15 };
 
 static void lgp_return_buffers(struct lgp *d, enum vb2_buffer_state state)
@@ -193,6 +202,11 @@ static const struct vb2_ops lgp_queue_ops = {
 	.buf_queue = lgp_buffer_queue,
 	.start_streaming = lgp_start_streaming,
 	.stop_streaming = lgp_stop_streaming,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+	/* Later kernels release the queue lock themselves while waiting. */
+	.wait_prepare = vb2_ops_wait_prepare,
+	.wait_finish = vb2_ops_wait_finish,
+#endif
 };
 
 static int lgp_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
@@ -241,7 +255,7 @@ static int lgp_try_fmt(struct file *file, void *fh, struct v4l2_format *fmt)
 	const struct v4l2_frmsize_discrete *size;
 
 	size = v4l2_find_nearest_size(sizes, ARRAY_SIZE(sizes), width, height,
-				     fmt->fmt.pix.width, fmt->fmt.pix.height);
+				      fmt->fmt.pix.width, fmt->fmt.pix.height);
 	lgp_format(&fmt->fmt.pix, size->width, size->height);
 	return 0;
 }
@@ -303,7 +317,9 @@ static int lgp_set_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 {
 	struct lgp *d = video_drvdata(file);
 	struct v4l2_fract t = p->parm.capture.timeperframe;
-	unsigned int fps = t.numerator ? t.denominator / t.numerator : 30;
+	/* A zero in either field asks for the default rate. */
+	unsigned int fps = t.numerator && t.denominator ?
+			   t.denominator / t.numerator : 30;
 	unsigned int best = 30, distance = UINT_MAX, i, delta;
 
 	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -379,6 +395,16 @@ static const struct v4l2_file_operations lgp_fops = {
 	.unlocked_ioctl = video_ioctl2,
 };
 
+static void lgp_free(struct lgp *d)
+{
+	vfree(d->frame);
+	kfree(d->dma);
+	kfree(d->reply);
+	kfree(d->command);
+	kfree(d);
+}
+
+/* Runs when the last reference goes: after disconnect and the final close. */
 static void lgp_release(struct v4l2_device *v4l2)
 {
 	struct lgp *d = container_of(v4l2, struct lgp, v4l2);
@@ -387,9 +413,24 @@ static void lgp_release(struct v4l2_device *v4l2)
 	v4l2_ctrl_handler_free(&d->controls);
 	v4l2_device_unregister(v4l2);
 	usb_put_dev(d->usb);
-	vfree(d->frame);
-	kfree(d->dma);
-	kfree(d);
+	lgp_free(d);
+}
+
+/* Only the verified layout is supported: four bulk endpoints. */
+static bool lgp_endpoints_ok(const struct usb_host_interface *alt)
+{
+	static const u8 wanted[] = { 0x81, 0x02, 0x83, 0x04 };
+	unsigned int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(wanted); i++) {
+		for (j = 0; j < alt->desc.bNumEndpoints; j++)
+			if (alt->endpoint[j].desc.bEndpointAddress == wanted[i] &&
+			    usb_endpoint_xfer_bulk(&alt->endpoint[j].desc))
+				break;
+		if (j == alt->desc.bNumEndpoints)
+			return false;
+	}
+	return true;
 }
 
 static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
@@ -397,17 +438,17 @@ static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	struct lgp *d;
 	int ret;
 
-	/* Only the verified four-bulk-endpoint interface is supported. */
 	if (intf->cur_altsetting->desc.bInterfaceNumber != 0 ||
-	    !usb_check_bulk_endpoints(intf,
-				      (const u8[]){ 0x81, 0x83, 0x02, 0x04, 0 }))
+	    !lgp_endpoints_ok(intf->cur_altsetting))
 		return -ENODEV;
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
 	if (!d)
 		return -ENOMEM;
+	d->command = kmalloc(LGP_COMMAND_SIZE, GFP_KERNEL);
+	d->reply = kmalloc(LGP_COMMAND_SIZE, GFP_KERNEL);
 	d->dma = kmalloc(LGP_DMA_SIZE, GFP_KERNEL);
 	d->frame = vmalloc(LGP_MAX_FRAME);
-	if (!d->dma || !d->frame) {
+	if (!d->command || !d->reply || !d->dma || !d->frame) {
 		ret = -ENOMEM;
 		goto free;
 	}
@@ -415,8 +456,8 @@ static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	mutex_init(&d->lock);
 	spin_lock_init(&d->buffers_lock);
 	INIT_LIST_HEAD(&d->buffers);
-	d->width = 640;
-	d->height = 480;
+	d->width = 1280;
+	d->height = 720;
 	d->fps = 30;
 	d->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	d->queue.io_modes = VB2_MMAP | VB2_READ | VB2_DMABUF;
@@ -438,7 +479,8 @@ static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	v4l2_ctrl_handler_init(&d->controls, 1);
 	/* Controls take their own mutex inside ioctls already holding d->lock. */
 	d->quality = v4l2_ctrl_new_std(&d->controls, NULL,
-			V4L2_CID_JPEG_COMPRESSION_QUALITY, 1, 100, 1, 75);
+				       V4L2_CID_JPEG_COMPRESSION_QUALITY,
+				       1, 100, 1, 75);
 	if (d->controls.error) {
 		ret = d->controls.error;
 		goto put_v4l2;
@@ -469,9 +511,7 @@ release_queue:
 put_usb:
 	usb_put_dev(d->usb);
 free:
-	vfree(d->frame);
-	kfree(d->dma);
-	kfree(d);
+	lgp_free(d);
 	return ret;
 }
 
@@ -520,5 +560,5 @@ MODULE_DESCRIPTION("AVerMedia Live Gamer Portable Lite GL310 native MJPEG webcam
 MODULE_AUTHOR("lgp-lite-linux-driver contributors");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1.0");
-MODULE_FIRMWARE("avermedia/qpvidfwusb.bin");
-MODULE_FIRMWARE("avermedia/qpaudfwusb.bin");
+MODULE_FIRMWARE(LGP_VIDEO_FIRMWARE);
+MODULE_FIRMWARE(LGP_AUDIO_FIRMWARE);

@@ -1,6 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Run after loading the corrected module, with other camera consumers closed.
+# Hardware checks for the native driver: V4L2 compliance including streaming,
+# then capture and decode at every advertised size and rate.
+#
+# Needs v4l-utils and FFmpeg, an active HDMI source, and no other program
+# using the card. Results are kept under captures/, which Git ignores.
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -26,39 +30,44 @@ timeout --kill-after=3s 20s v4l2-ctl -d "$device" --all --list-formats-ext \
     > "$results/device.txt" 2>&1
 cat "$results/device.txt"
 status=0
-if ! timeout --kill-after=3s 90s v4l2-compliance -d "$device" \
+# -s streams with every I/O method, -f repeats that for every size and rate.
+if ! timeout --kill-after=3s 300s v4l2-compliance -d "$device" -s -f \
     > "$results/compliance.txt" 2>&1; then
     status=1
 fi
-cat "$results/compliance.txt"
-for dimensions in '640 480' '1280 720' '1920 1080'; do
+tail -n 40 "$results/compliance.txt"
+
+mapfile -t sizes < <(v4l2-ctl -d "$device" --list-framesizes=MJPG |
+    sed -n 's/.*Discrete \([0-9]*\)x\([0-9]*\).*/\1 \2/p')
+(( ${#sizes[@]} )) || { echo 'The driver advertises no frame sizes.' >&2; exit 1; }
+for dimensions in "${sizes[@]}"; do
     read -r width height <<< "$dimensions"
-    output="$results/${width}x${height}.mjpeg"
+    name=${width}x${height}
+    output=$results/$name.mjpeg
     timeout --kill-after=3s 30s v4l2-ctl -d "$device" \
         --set-fmt-video="width=$width,height=$height,pixelformat=MJPG" \
         --set-parm=30 --stream-mmap=4 --stream-count=120 --stream-to="$output"
-    ffmpeg -v error -f mjpeg -i "$output" -f null - \
-        2> "$results/${width}x${height}-decode.txt"
-    test ! -s "$results/${width}x${height}-decode.txt"
+    ffmpeg -v error -f mjpeg -i "$output" -f null - 2> "$results/$name-decode.txt"
+    test ! -s "$results/$name-decode.txt"
     ffprobe -v error -f mjpeg -count_frames -select_streams v:0 \
         -show_entries stream=codec_name,width,height,nb_read_frames \
-        -of default=noprint_wrappers=1 "$output" \
-        > "$results/${width}x${height}-probe.txt"
-    cat "$results/${width}x${height}-probe.txt"
-    rg -qx 'codec_name=mjpeg' "$results/${width}x${height}-probe.txt"
-    rg -qx "width=$width" "$results/${width}x${height}-probe.txt"
-    rg -qx "height=$height" "$results/${width}x${height}-probe.txt"
-    rg -qx 'nb_read_frames=120' "$results/${width}x${height}-probe.txt"
+        -of default=noprint_wrappers=1 "$output" > "$results/$name-probe.txt"
+    cat "$results/$name-probe.txt"
+    grep -qx 'codec_name=mjpeg' "$results/$name-probe.txt"
+    grep -qx "width=$width" "$results/$name-probe.txt"
+    grep -qx "height=$height" "$results/$name-probe.txt"
+    grep -qx 'nb_read_frames=120' "$results/$name-probe.txt"
+    # Timestamps come from the encoder clock; FFmpeg reports any that repeat
+    # or run backwards.
+    for fps in 15 30; do
+        timeout --kill-after=3s 20s ffmpeg -nostdin -v error -f v4l2 \
+            -input_format mjpeg -video_size "$name" -framerate "$fps" \
+            -i "$device" -frames:v 60 -f null - 2> "$results/$name-live-${fps}fps.txt"
+        test ! -s "$results/$name-live-${fps}fps.txt"
+    done
 done
-for fps in 15 30; do
-    timeout --kill-after=3s 20s ffmpeg -nostdin -v error -f v4l2 \
-        -input_format mjpeg -video_size 640x480 -framerate "$fps" \
-        -i "$device" -frames:v 60 -f null - \
-        2> "$results/live-${fps}fps.txt"
-    test ! -s "$results/live-${fps}fps.txt"
-done
-# Leave the default webcam format selected after successful checks.
+# Leave the driver's default format selected.
 v4l2-ctl -d "$device" \
-    --set-fmt-video=width=640,height=480,pixelformat=MJPG --set-parm=30
+    --set-fmt-video=width=1280,height=720,pixelformat=MJPG --set-parm=30
 echo "Capture checks completed; compliance status=$status. Results: $results"
 exit "$status"

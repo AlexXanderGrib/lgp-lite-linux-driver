@@ -247,8 +247,10 @@ After the ordinary firmware boot, send:
 Write the ordinary register bank with system control `0x6f8 = 0x2101c20e`.
 `CTaskEncode::enableMJPEG` sets the low 12 bits to `0x20e` and the system
 function's low byte to 2. Input resolution at `0x6f4` stays at the source's
-dimensions. Output resolution at `0x6dc` can request hardware scaling;
-1920×1080 input to 640×480 output was verified. Then send start command 1.
+dimensions. Output resolution at `0x6dc` requests hardware downscaling;
+1920×1080 input was verified at 640×360, 960×540 and 1280×720 output. The
+scaler stretches the whole picture to the requested size (640×480 output of a
+16:9 input is distorted, not cropped). Then send start command 1.
 
 Messages 0x40/0x41 still report type **0x83**. After reversing each 32-bit
 word's bytes, JPEGs start with `ff d8` and end with `ff d9`, with possible
@@ -256,7 +258,8 @@ trailing alignment padding. **A firmware buffer can split a JPEG when the
 circular stream buffer wraps.** Return each firmware buffer promptly with
 command 0x30 and retain partial JPEG bytes across messages. Publish a V4L2
 buffer only after finding EOI, excluding up to seven alignment bytes from
-`bytesused`. The mailbox IRQ publication rule also applies here.
+`bytesused`. Data that does not begin with SOI is discarded until the next
+frame start. The mailbox IRQ publication rule also applies here.
 
 MJPEG timestamps come from the first fragment's param5, with software PTS
 enabled through command `0x10`, parameters `0x17, 1`. The numeric counter

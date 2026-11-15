@@ -2,26 +2,32 @@
 
 # lgp-lite-linux-driver
 
-Experimental Linux drivers for the **AVerMedia Live Gamer Portable Lite /
-GL310**, USB **07ca:c835**:
+Linux drivers for the **AVerMedia Live Gamer Portable Lite (GL310)**, USB ID
+`07ca:c835`. The card has no UVC interface and no upstream Linux support.
 
-- **Native V4L2 webcam:** the `lgplite` kernel module exposes hardware MJPEG
-  through `/dev/video*` for webcam applications. No userspace bridge is required.
-- **Standalone recorder:** a dependency-free Python driver records the hardware
-  encoder's MPEG-TS stream with H.264 video and AAC audio through Linux usbfs.
+- **Native V4L2 webcam.** The `lgplite` kernel module exposes the card's
+  hardware MJPEG encoder as an ordinary `/dev/video*` device for OBS, browsers,
+  Discord, FFmpeg and other camera applications.
+- **Standalone recorder.** A dependency-free Python tool records the hardware
+  encoder's MPEG-TS stream (H.264 video, AAC audio) through usbfs, with no
+  kernel module.
 
-**Verified on a real GL310:** native MJPEG capture at 640×480, 1280×720, and
-1920×1080 at 30 fps; 15 fps at 640×480; all 63 V4L2 compliance and streaming
-checks, including every advertised size/rate; and capture recovery after
-driver unbind/rebind. A 30-second
-native 1080p30 run decoded all 900 frames with no errors or timestamp warnings.
-The module is installed through DKMS with Secure Boot signing. The Python
-H.264/AAC recorder also passed decode and timestamp checks on a 45-second recording.
+This is an experimental driver written from reverse engineering and tested on
+one GL310. See [Current limits](#current-limits) before relying on it.
 
-## Setup
+| | Native webcam | Standalone recorder |
+| --- | --- | --- |
+| Output | MJPEG, video only | MPEG-TS file or pipe, H.264 + AAC |
+| Sizes | 640×360, 960×540, 1280×720, 1920×1080 | Same as the HDMI input |
+| Frame rates | 15 or 30 fps | Up to 30 fps at 1080p, 60 fps at 720p |
+| Needs | Kernel headers, DKMS | Python 3 |
 
-The firmware is proprietary and is **not included**. Copy it from your Windows
-installation or an AVerMedia GL310 driver installer/ZIP you already have:
+## Firmware
+
+The card's encoder runs firmware that the host uploads each time capture
+starts. That firmware is proprietary and is **not included**. Copy it from a
+Windows installation of the AVerMedia software, or from an AVerMedia GL310
+driver installer or ZIP that you already have:
 
 ```sh
 tools/get-firmware.sh '/path/to/Windows/Program Files (x86)/AVerMedia'
@@ -29,92 +35,101 @@ tools/get-firmware.sh '/path/to/Windows/Program Files (x86)/AVerMedia'
 tools/get-firmware.sh /path/to/GL310_driver.zip
 ```
 
-The script verifies both SHA-256 hashes and creates `firmware/`, ignored by Git.
-Driver packages 3.7.x.39 and 3.2802.x.40 contain the supported images. You can
-also pass `--firmware DIR`, set `LGPLITE_FIRMWARE`, or put the images under
-`~/.local/share/lgplite/` or `/lib/firmware/avermedia/`.
+The script checks both files against known SHA-256 hashes and writes them to
+`firmware/`, which Git ignores. Driver packages 3.7.x.39 and 3.2802.x.40 contain
+the supported images.
 
 ## Native V4L2 webcam
 
-Install your distribution's kernel headers, DKMS, compiler, and make, then:
+Requires Linux 6.2 or newer with kernel headers, DKMS, a compiler and make.
+The module builds against 6.2, 6.17 and 7.0; it has been run on 7.0 only.
 
 ```sh
-make -C kernel
 sudo bash tools/install-native.sh
 v4l2-ctl --list-devices
 ```
 
-The installer copies the verified firmware to `/lib/firmware/avermedia/`,
-registers the driver with DKMS for future kernel updates, and loads it.
-With Secure Boot, DKMS signs using the distribution's module-signing key;
-that key must already be enrolled. The development PC's existing key is enrolled.
-The USB device ID lets the module load automatically on boot and reconnection.
+The installer copies the firmware to `/lib/firmware/avermedia/`, registers the
+module with DKMS so it is rebuilt on kernel updates, and loads it. The module
+then loads by itself whenever the card is connected.
 
 Select **AVerMedia GL310** in the application's camera list. In OBS, add a
-**Video Capture Device (V4L2)** source and choose **Motion-JPEG**. The initial
-format is 640×480 at 30 fps. Advertised sizes are 640×480, 1280×720, and
-1920×1080; advertised rates are 15 and 30 fps. Output dimensions and
-frame rate must not exceed the HDMI source. All three sizes were tested at
-30 fps; lower rates were tested at 640×480. The JPEG quality control is set
-before starting capture.
-24/25 fps output is not advertised because its firmware timestamps were
-inconsistent in native application tests.
-
-For a direct preview, substitute the actual GL310 node:
+**Video Capture Device (V4L2)** source and choose **Motion-JPEG**. For a direct
+preview, substitute the card's actual node:
 
 ```sh
-ffplay -f v4l2 -input_format mjpeg -video_size 640x480 -framerate 30 /dev/video0
+ffplay -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 /dev/video0
 ```
 
-The native interface supplies **video only**. HDMI audio is supported by the
-standalone MPEG-TS recorder, but an ALSA microphone interface is not implemented.
-Only one application can stream from the card at a time. Close camera consumers
-before installing an updated module. `--no-load` installs for the next reboot
-without attempting to reload the running module.
-
-With `v4l-utils`, FFmpeg, and ripgrep installed, run the native checks with
-other camera consumers closed:
+The default format is 1280×720 at 30 fps. The encoder scales the HDMI picture
+down but not up, so the size and rate must not exceed those of the HDMI source.
+JPEG quality is the `compression_quality` control, 1 to 100, and can be changed
+while the card is not streaming:
 
 ```sh
-bash tools/validate-native.sh
+v4l2-ctl -d /dev/video0 --set-ctrl=compression_quality=90
 ```
 
-An additional hardware test exercises driver removal during capture, with an
-open video handle, and verifies that capture starts again after rebinding:
+The native interface supplies **video only**; an ALSA capture device for HDMI
+audio is not implemented. Only one application can stream from the card at a
+time. Video device numbers can change after reconnecting, so select the card
+by name.
+
+### Secure Boot
+
+With Secure Boot enabled the kernel only loads signed modules. DKMS signs
+`lgplite` with the machine owner key (MOK), which must be enrolled once. If
+`modprobe lgplite` fails with `Key was rejected by service`, enroll the key
+your distribution's DKMS uses and reboot. On Ubuntu:
 
 ```sh
-sudo python3 tools/test-native-disconnect.py
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
 ```
 
-Video device numbers can change after reconnecting. Select the card by its
-**AVerMedia GL310** name, or find its current node with `v4l2-ctl --list-devices`.
+### Updating and removing
 
-To remove the native driver (leave other webcam drivers loaded):
+Close camera applications and run the installer again to update. Pass
+`--no-load` to install for the next reboot without reloading the running
+module. To remove the driver:
 
 ```sh
 sudo modprobe -r lgplite
 sudo dkms remove lgplite/0.1.0 --all
 sudo rm -r /usr/src/lgplite-0.1.0
+sudo rm /lib/firmware/avermedia/qpvidfwusb.bin /lib/firmware/avermedia/qpaudfwusb.bin
 ```
 
-## Standalone recorder setup
+### Hardware checks
 
-The native driver owns the USB interface while loaded. To use the standalone
-recorder, first close webcam applications and run `sudo modprobe -r lgplite`.
-After recording, `sudo modprobe lgplite` restores the native webcam.
+With `v4l-utils` and FFmpeg installed, an active HDMI source, and other camera
+applications closed:
 
-Install USB access rules once, then unplug and reconnect the GL310:
+```sh
+bash tools/validate-native.sh
+sudo python3 tools/test-native-disconnect.py
+```
+
+The first runs `v4l2-compliance` including streaming, then captures and decodes
+every advertised size and rate. The second unbinds the driver in the middle of
+a capture while holding the video device open, and checks that capture starts
+again after rebinding.
+
+## Standalone recorder
+
+The kernel module owns the USB interface while it is loaded. To use the
+recorder, close camera applications and run `sudo modprobe -r lgplite`;
+`sudo modprobe lgplite` restores the webcam afterwards.
+
+Install the USB access rule once, then unplug and reconnect the card:
 
 ```sh
 sudo install -m 0644 udev/70-avermedia-lgp-lite.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 ```
 
-The rule grants access to the active local desktop user. For a remote/headless
-session, configure USB permissions for that account or run the tool as root.
-The rule is already installed on the development machine used for this project.
-
-## Capture
+The rule grants access to the user logged in at the local desktop. For a
+remote or headless session, grant that account access to the USB device, or
+run the tool as root.
 
 Connect a source to **HDMI IN**, select stereo PCM audio on that source, then:
 
@@ -124,9 +139,9 @@ python3 userspace/lgplite.py capture recording.ts --seconds 30
 ffplay recording.ts
 ```
 
-Omit `--seconds` to record until Ctrl+C. Each capture loads and verifies firmware,
-detects the input timing, and stops the encoder on exit. Existing output files
-are preserved; choose a new name for each recording.
+Omit `--seconds` to record until Ctrl+C. Each capture loads and verifies the
+firmware, detects the input timing, and stops the encoder on exit. Existing
+output files are never overwritten; choose a new name for each recording.
 
 ```sh
 # Video bitrate in kbit/s (default 8000, range 1000–20000).
@@ -140,39 +155,70 @@ ffmpeg -i recording.ts -c copy recording.mkv
 ```
 
 `--fps` changes the output frame rate. The default is the input rate, capped
-at 30 fps for 1080p and 60 fps for 720p. `--timeout` controls how long to wait
-without video before failing (default 5 seconds).
+at 30 fps for 1080p and 60 fps for 720p. `--timeout` sets how long to wait
+without video before failing (default 5 seconds). The recorder finds the
+firmware in `firmware/`, in the directory given by `--firmware DIR` or
+`LGPLITE_FIRMWARE`, in `~/.local/share/lgplite/`, or in
+`/lib/firmware/avermedia/`.
 
 ## Current limits
 
-- Tested on GL310/C835 only. The native module binds only `07ca:c835`.
-  The standalone recorder also recognizes the untested alternate `07ca:d835` ID.
-- Mode tables cover progressive 1080p24/25/30/50/60 and 720p50/60. Only
-  1080p60 input has been verified on hardware. Native output tests are listed
-  above; the standalone H.264/AAC recorder was tested at 1080p30. Rates are nominal;
-  fractional source rates have not been tested.
-- Interlaced video, custom PC timings, compressed HDMI audio, and live input
-  changes are unsupported. Restart capture after changing the HDMI mode.
-- Capture reads the board's current HDMI input. MCU firmware updates, flash
-  writes, input switching, and automatic hotplug recovery are not implemented.
-- Only one application can claim the USB interface at a time.
+- Tested on one GL310 (`07ca:c835`) with a 1080p60 source. The recorder also
+  accepts the alternate ID `07ca:d835`, which is untested.
+- Supported HDMI inputs are progressive 1080p at 24, 25, 30, 50 or 60 Hz and
+  720p at 50 or 60 Hz. Only 1080p60 has been verified on hardware. Interlaced
+  video, PC timings such as 1440p, fractional rates, and compressed HDMI audio
+  are not supported.
+- Capture uses the HDMI mode present when it starts; restart it after
+  changing the source's mode. Suspend and resume during capture is untested.
+- The webcam does not offer 24 or 25 fps: the firmware's timestamps were
+  inconsistent at those rates.
+- No HDMI audio in the native driver. MCU firmware updates and flash writes
+  are not implemented.
+- Timestamps follow the encoder's clock, anchored to the host clock when
+  capture starts. The two clocks can drift apart in very long sessions.
 
-## Diagnostics and tests
+## Troubleshooting
+
+- `Firmware avermedia/qpvidfwusb.bin is missing` in `dmesg`: run
+  `tools/get-firmware.sh`, then the installer again.
+- Starting capture fails with `Link has been severed`: no HDMI signal. With
+  `Numerical result out of range`, the source's mode is unsupported or smaller
+  than the requested size; `dmesg` names the detected timing.
+- The card stops answering after an interrupted session: unplug it, wait five
+  seconds, and reconnect it.
+- The recorder reports that the device is in use: unload the kernel module
+  first, as described above.
+
+Recorder diagnostics:
 
 ```sh
 python3 userspace/lgplite.py info
 python3 userspace/lgplite.py -v boot
 python3 userspace/lgplite.py reg 0x38
-python3 -m unittest discover -s tests -v
-ffprobe -v error -show_streams recording.ts
-ffmpeg -v error -i recording.ts -f null -
 ```
 
-Verbose capture logs every firmware message and can be large. Register writes
-are available for development (`reg ADDRESS VALUE`); normal capture needs no
-manual register commands. If a run is interrupted by unplugging or a USB error,
-reconnect the device and start a new capture.
+Verbose capture logs every firmware message. Register writes are available for
+development (`reg ADDRESS VALUE`); normal capture needs none.
 
-The protocol and reverse-engineering sources are documented in
+## Development
+
+```sh
+make -C kernel                          # build the module in place
+python3 -m unittest discover -s tests   # recorder unit tests, no hardware
+```
+
+The protocol and how it was established are documented in
 [docs/PROTOCOL.md](docs/PROTOCOL.md). Hardware test results are in
 [docs/VALIDATION.md](docs/VALIDATION.md).
+
+## License and disclaimer
+
+GPL-2.0-only; see [LICENSE](LICENSE).
+
+This project is not affiliated with or endorsed by AVerMedia. AVerMedia and
+Live Gamer Portable are trademarks of their owner. The protocol was worked out
+for interoperability by observing the device and analysing the vendor's
+Windows driver; the repository contains no vendor code and no firmware. The
+software comes with no warranty: it uploads firmware to and reconfigures your
+capture card, so use it at your own risk.
