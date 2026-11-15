@@ -38,6 +38,24 @@ done
 HASHES
 ) || die 'firmware/ does not hold the supported images; rerun tools/get-firmware.sh'
 
+# Prove that the new sources build before replacing a working installation.
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT
+cp "$project_dir"/kernel/{Makefile,Kbuild,lgplite.h,lgplite-hw.c,lgplite-video.c} "$scratch/"
+make -s -C "$scratch" KDIR="/lib/modules/$kernel_version/build" >"$scratch/build.log" 2>&1 || {
+    cat "$scratch/build.log" >&2
+    die "the module does not build for $kernel_version; nothing was changed"
+}
+
+# Other kernels that have this version installed are rebuilt afterwards.
+other_kernels=()
+for dir in "/var/lib/dkms/lgplite/$module_version"/*/; do
+    kernel=$(basename -- "$dir")
+    if [[ $kernel != "$kernel_version" && -d /lib/modules/$kernel/build ]]; then
+        other_kernels+=("$kernel")
+    fi
+done
+
 install -d /lib/firmware/avermedia
 install -m 0644 "$project_dir/firmware/qpvidfwusb.bin" \
     "$project_dir/firmware/qpaudfwusb.bin" /lib/firmware/avermedia/
@@ -53,6 +71,10 @@ dkms add -m lgplite -v "$module_version"
 dkms build -m lgplite -v "$module_version" -k "$kernel_version"
 # With Secure Boot, DKMS signs the module with the machine owner key.
 dkms install -m lgplite -v "$module_version" -k "$kernel_version"
+for kernel in "${other_kernels[@]}"; do
+    dkms install -m lgplite -v "$module_version" -k "$kernel" ||
+        echo "install-native.sh: warning: not installed for kernel $kernel" >&2
+done
 
 if [[ $load_module == no ]]; then
     echo 'Installed the GL310 webcam driver for the next load or reboot.'
@@ -65,5 +87,7 @@ if [[ -d /sys/module/lgplite ]]; then
 fi
 modprobe lgplite || die 'the module did not load. Under Secure Boot the DKMS
 signing key must be enrolled first: see "Secure Boot" in the README.'
-udevadm settle
+if command -v udevadm >/dev/null; then
+    udevadm settle
+fi
 echo 'Installed the GL310 webcam driver. Find it with: v4l2-ctl --list-devices'

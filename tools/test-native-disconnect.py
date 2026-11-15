@@ -81,10 +81,13 @@ def main():
                     "ffmpeg", "-nostdin", "-v", "error", "-f", "v4l2",
                     "-input_format", "mjpeg", "-video_size", "640x480",
                     "-framerate", "30", "-i", "/dev/" + new_node.name,
-                    "-frames:v", "30", "-f", "null", "-",
-                ], check=True, timeout=15, stdout=subprocess.DEVNULL,
+                    "-frames:v", "30", "-progress", "pipe:1", "-f", "null", "-",
+                ], check=True, timeout=15, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
                 assert not result.stderr, result.stderr
+                # -frames:v is only an upper limit; make sure all 30 arrived.
+                frames = [v for v in result.stdout.splitlines() if v.startswith("frame=")]
+                assert frames and frames[-1] == "frame=30", frames[-1:]
                 print("Capture after reconnect passed", flush=True)
     finally:
         if capture is not None and capture.poll() is None:

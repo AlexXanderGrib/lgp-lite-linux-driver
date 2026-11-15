@@ -62,8 +62,11 @@ for dimensions in "${sizes[@]}"; do
     for fps in 15 30; do
         timeout --kill-after=3s 20s ffmpeg -nostdin -v error -f v4l2 \
             -input_format mjpeg -video_size "$name" -framerate "$fps" \
-            -i "$device" -frames:v 60 -f null - 2> "$results/$name-live-${fps}fps.txt"
+            -i "$device" -frames:v 60 -progress "$results/$name-live-${fps}fps-progress.txt" \
+            -f null - 2> "$results/$name-live-${fps}fps.txt"
         test ! -s "$results/$name-live-${fps}fps.txt"
+        # -frames:v is only an upper limit; make sure all 60 arrived.
+        test "$(grep '^frame=' "$results/$name-live-${fps}fps-progress.txt" | tail -n 1)" = frame=60
     done
 done
 # Leave the driver's default format selected.

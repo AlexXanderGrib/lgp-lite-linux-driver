@@ -202,8 +202,8 @@ static const struct vb2_ops lgp_queue_ops = {
 	.buf_queue = lgp_buffer_queue,
 	.start_streaming = lgp_start_streaming,
 	.stop_streaming = lgp_stop_streaming,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
-	/* Later kernels release the queue lock themselves while waiting. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+	/* Since 6.13 vb2 releases the queue lock itself while waiting. */
 	.wait_prepare = vb2_ops_wait_prepare,
 	.wait_finish = vb2_ops_wait_finish,
 #endif

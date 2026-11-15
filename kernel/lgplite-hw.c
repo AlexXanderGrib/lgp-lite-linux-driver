@@ -693,6 +693,15 @@ int lgp_hw_frame(struct lgp *d, unsigned int *length)
 	ret = lgp_return_buffer(d, m, m[4]);
 	if (ret)
 		return ret;
+	if (d->frame_length && bytes &&
+	    out[0] == 0xff && out[1] == 0xd8 && out[2] == 0xff) {
+		/* A new JPEG begins although the pending one never ended. */
+		dev_warn_ratelimited(&d->usb->dev, "Dropping unfinished frame\n");
+		memmove(d->frame, out, bytes);
+		d->frame_length = 0;
+		d->frame_pts = m[5];
+		d->sequence++;
+	}
 	bytes += d->frame_length;
 	if (!bytes)
 		return 0;
