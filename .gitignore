@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+/firmware/
+/captures/
+/kernel/*.o
+/kernel/*.ko
+/kernel/*.mod
+/kernel/*.mod.c
+/kernel/.*.cmd
+/kernel/Module.symvers
+/kernel/modules.order

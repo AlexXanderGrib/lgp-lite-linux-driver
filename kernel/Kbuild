@@ -1,0 +1,2 @@
+obj-m := lgplite.o
+lgplite-y := lgplite-video.o lgplite-hw.o

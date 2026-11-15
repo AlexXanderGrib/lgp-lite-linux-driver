@@ -1,0 +1,6 @@
+# AVerMedia Live Gamer Portable Lite (GL310 / C835)
+#
+# Grants the locally logged-in user access to the raw USB device so the
+# userspace tools in this repository can talk to it without root.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="07ca", ATTR{idProduct}=="c835", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="07ca", ATTR{idProduct}=="d835", TAG+="uaccess"
