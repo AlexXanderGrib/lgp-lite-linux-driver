@@ -87,6 +87,9 @@ REG_ARM_PARAM1 = 0x6F8
 REG_ARM_MESSAGE = 0x6FC
 REG_INTERRUPT = 0x800
 MCU_ADDR = 0x15  # The INF's USBMcuAddr 0x2b is an 8-bit I2C address.
+MCU_LED = 0x2C   # write-only pattern of the light ring around the button
+LED_CHASE = 4    # the power-on pattern: segments run clockwise
+LED_SOLID = 5    # shown while recording
 TS_BUFFER_TYPE = 0x83
 SOC_MEMORY_SIZE = 64 * 1024 * 1024
 
@@ -525,13 +528,30 @@ class Device:
         return swap_words(data)
 
     # -- HDMI input and capture ----------------------------------------------
-    def mcu_read(self, reg, length=1):
+    def _wait_mcu(self):
         # GPIO13 is MCU ready (input, active high). Match the driver's retries.
         for _ in range(3):
             if self.hci.reg_read(REG_GPIO_INPUT) & (1 << 13):
                 break
             time.sleep(0.03)
+
+    def mcu_read(self, reg, length=1):
+        self._wait_mcu()
         return self.hci.swi2c_read(MCU_ADDR, length, bytes([reg]))
+
+    def mcu_write(self, reg, value):
+        self._wait_mcu()
+        self.hci.swi2c_write(MCU_ADDR, bytes([reg, value]))
+
+    def show_recording(self, recording):
+        """Light the button ring solid while recording, else restore the chase.
+
+        A failure costs only the indication, so it is reported, not raised.
+        """
+        try:
+            self.mcu_write(MCU_LED, LED_SOLID if recording else LED_CHASE)
+        except (DeviceError, OSError) as e:
+            print("lgplite: cannot set the button light: %s" % e, file=sys.stderr)
 
     def signal_info(self):
         for _ in range(10):
@@ -667,17 +687,21 @@ def cmd_capture(dev, args):
             dev.boot(args.firmware)
             try:
                 dev.start_capture(info, args.bitrate, args.fps)
+                dev.show_recording(True)
                 size, blocks, elapsed = dev.capture(stream, args.seconds, args.timeout, lambda: stopped)
                 stream.flush()
             finally:
-                # Preserve the original error if e.g. unplugging also breaks stop.
-                if sys.exc_info()[0] is not None:
-                    try:
+                try:
+                    # Preserve the original error if e.g. unplugging also breaks stop.
+                    if sys.exc_info()[0] is not None:
+                        try:
+                            dev.stop_capture()
+                        except (DeviceError, OSError) as e:
+                            print("lgplite: cleanup: %s" % e, file=sys.stderr)
+                    else:
                         dev.stop_capture()
-                    except (DeviceError, OSError) as e:
-                        print("lgplite: cleanup: %s" % e, file=sys.stderr)
-                else:
-                    dev.stop_capture()
+                finally:
+                    dev.show_recording(False)
         print("Captured %d bytes in %.1f s (%d buffers)" % (size, elapsed, blocks), file=sys.stderr)
     finally:
         for s, handler in handlers.items():

@@ -17,6 +17,15 @@
 #define LGP_DMA_SIZE 0x8000		/* largest bulk memory transfer */
 #define LGP_MAX_FRAME (1920 * 1080 * 2)	/* upper bound for one JPEG */
 
+/* Values of the Button Light control. */
+enum lgp_light {
+	LGP_LIGHT_AUTO,		/* solid while capturing, otherwise clockwise */
+	LGP_LIGHT_CLOCKWISE,	/* one LED at a time: the power-on pattern */
+	LGP_LIGHT_SOLID,
+	LGP_LIGHT_FADE,		/* the whole ring fades in and out */
+	LGP_LIGHT_FAST,		/* clockwise, faster */
+};
+
 struct lgp_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
@@ -29,6 +38,7 @@ struct lgp {
 	struct vb2_queue queue;
 	struct v4l2_ctrl_handler controls;
 	struct v4l2_ctrl *quality;
+	struct v4l2_ctrl *light;
 	/* Serializes ioctls, the buffer queue and stream start/stop. */
 	struct mutex lock;
 	/* Protects the list of queued buffers. */
@@ -54,6 +64,16 @@ struct lgp {
 	u64 pts_ticks;
 	u64 timestamp_base;
 
+	/* The front-panel button, polled while its input device is open. */
+	struct input_dev *button;
+	unsigned short keymap[1];
+	char button_phys[64];
+
+	/* Keeps each USB command with its reply, so that the button poll can
+	 * run during capture. Guards the command and reply buffers.
+	 */
+	struct mutex io_lock;
+
 	/* USB transfer buffers. Allocated separately so each is DMA-safe. */
 	u8 *command;
 	u8 *reply;
@@ -64,5 +84,12 @@ int lgp_hw_start(struct lgp *dev);
 int lgp_hw_stop(struct lgp *dev);
 /* Returns 1 for a complete frame, 0 if none is ready, or a negative errno. */
 int lgp_hw_frame(struct lgp *dev, unsigned int *length);
+/* Returns the oldest board MCU event, 0 if none is queued, or an errno. */
+int lgp_hw_event(struct lgp *dev);
+/* Any pattern but LGP_LIGHT_AUTO. */
+int lgp_hw_light(struct lgp *dev, enum lgp_light light);
+
+int lgp_button_register(struct lgp *dev, struct usb_interface *intf);
+void lgp_button_unregister(struct lgp *dev);
 
 #endif

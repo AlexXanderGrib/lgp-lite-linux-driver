@@ -132,6 +132,71 @@ Sources: `InterfaceNUC100::getHdmiVideo_6604` (timing table at Ghidra address
 0x000fa740 in the analyzed binary), `getHdmiAudio_6604`,
 `MCU<ProjectC875>::IsCompressedAudio`, `MCU<ProjectC875>::bIsBusy`.
 
+## Board MCU events and the button
+
+The MCU queues events and holds **GPIO 12** (register 0x618 bit 12) low while
+any are queued. The Windows driver polls that bit every 125 ms. When it is
+low, wait 5 ms and read MCU register **0x2b**: the value is the oldest event,
+and the read removes it from the queue. The line goes high again once the
+queue is empty. Neither firmware boot nor a running encoder is required.
+
+| Event | Windows driver action |
+| --- | --- |
+| 1, 7, 10 | HDMI signal changed: re-read the input timing |
+| 3 | MCU confirms the RTC time that the driver set |
+| 4 | Audio switch done: re-read the audio format |
+| 5 | Mode change: driver writes 8 to MCU register 0x2c |
+| 6 | **Button click** |
+
+On this GL310, a click produced one event 6, whether short or held for three
+seconds. A hold of about eight seconds produced no event. The MCU reports no
+release, and no register in the SoC GPIO input or MCU 0x00..0xff follows the
+button while it is held. GPIO 13 (MCU ready) drops for 200-250 ms just before
+each event, however long the press was. Fast double clicks produced one event
+each; one slower double click produced two events 0.27 s apart, but most
+double clicks at a relaxed pace still lost the second press.
+
+The Windows click handler also writes 0 to register 0x2b. The register
+already reads 0 after the event has been read, and later clicks are reported
+without that write. Events 10 and 1 were queued after the HDMI source
+changed. Clicks are reported whatever the light ring shows (next section).
+
+Sources: `CMCUEventMgr<ProjectC875>::InitEvent`, `IsEvent`,
+`GetEventNumber`, `CButtonSingleClick<ProjectC875>::DoAction`,
+`CMCUShutDown<ProjectC875>::DoAction`, `CQLCodec_GetGPIOBitValue`, and
+`ProjectC875::m_MCUEventGPIO = 12`.
+
+## Light ring
+
+Writing MCU register **0x2c** selects the pattern of the four LEDs around the
+button. The MCU consumes the value within about 0.1 s, after which the
+register reads 0, and the new pattern starts. Observed on this GL310:
+
+| Value | Pattern |
+| --- | --- |
+| 3 | Whole ring fades in and out, about 2 s per cycle |
+| 4 | LEDs light one at a time, clockwise: the pattern from power-on |
+| 5 | Solid |
+| 0x0b | As 4, but faster: about two turns in 0.9 s |
+
+MCU register 0xfb counts down by 3 every 66 ms and wraps near 0x20 while the
+clockwise pattern runs, which suggests an animation step timer. About every
+10 s a read of the MCU registers returns bytes of 0xff while the MCU is busy.
+
+The vendor software lights the ring solid while recording. The Windows
+driver writes 5 during initialization and 8 after a mode-change event (event
+5 above); 8 was not tried. `PROJECT_PROPERTY_SET_LED` (267) passes an
+application's value to register 0x2c. The C875 trace in the sibling
+repository writes 0x0b, 3 and 5 in turn just before capture starts.
+
+`PROJECT_PROPERTY_SET_RECORDING` (268) writes its value to MCU register
+**0x3d**, which keeps it. Setting it to 1 or 0 did not change the light, so
+this implementation does not write it.
+
+The property numbers come from the PDB's `_PROJECT_PROPERTY` enumeration. In
+`ProjectC875::setProperty` the decompiler labels each case with the value
+minus 257; the debug strings in the cases give the real names.
+
 ## Mailbox
 
 Host → ARM:
@@ -287,6 +352,7 @@ and 640×480 JPEG frames.
 
 ## Remaining work
 
-Additional timing modes, automatic input-change recovery, ALSA audio, and
-testing on more devices remain open. The proprietary files and analyzed
-Windows binaries are excluded from the repository.
+Additional timing modes, automatic input-change recovery (the MCU signal
+events above could drive it), ALSA audio, and testing on more devices remain
+open. The proprietary files and analyzed Windows binaries are excluded from
+the repository.

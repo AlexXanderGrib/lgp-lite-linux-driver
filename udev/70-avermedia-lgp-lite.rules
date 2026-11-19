@@ -4,3 +4,6 @@
 # userspace tools in this repository can talk to it without root.
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="07ca", ATTR{idProduct}=="c835", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="07ca", ATTR{idProduct}=="d835", TAG+="uaccess"
+
+# The button that the lgplite kernel module reports, for userspace/lgplite-button.py.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="AVerMedia GL310 Button", TAG+="uaccess"

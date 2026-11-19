@@ -41,7 +41,8 @@ HASHES
 # Prove that the new sources build before replacing a working installation.
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
-cp "$project_dir"/kernel/{Makefile,Kbuild,lgplite.h,lgplite-hw.c,lgplite-video.c} "$scratch/"
+sources=(Makefile Kbuild lgplite.h lgplite-hw.c lgplite-video.c lgplite-button.c)
+cp "${sources[@]/#/$project_dir/kernel/}" "$scratch/"
 make -s -C "$scratch" KDIR="/lib/modules/$kernel_version/build" >"$scratch/build.log" 2>&1 || {
     cat "$scratch/build.log" >&2
     die "the module does not build for $kernel_version; nothing was changed"
@@ -64,7 +65,7 @@ if [[ -n $(dkms status -m lgplite -v "$module_version") ]]; then
 fi
 rm -rf -- "$source_dir"
 install -d "$source_dir"
-for source in Makefile Kbuild dkms.conf lgplite.h lgplite-hw.c lgplite-video.c; do
+for source in "${sources[@]}" dkms.conf; do
     install -m 0644 "$project_dir/kernel/$source" "$source_dir/"
 done
 dkms add -m lgplite -v "$module_version"

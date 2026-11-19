@@ -25,6 +25,64 @@ static const struct v4l2_frmsize_discrete sizes[] = {
 
 static const unsigned int rates[] = { 30, 15 };
 
+/* Driver-private control; IDs only need to be unique within the device. */
+#define LGP_CID_LIGHT (V4L2_CID_USER_BASE + 0x1f00)
+
+/* Shows the pattern that the Button Light control selects. Callers hold
+ * d->lock, which also guards d->running, or run before registration.
+ */
+static int lgp_show_light(struct lgp *d, s32 light)
+{
+	if (light == LGP_LIGHT_AUTO)
+		light = d->running ? LGP_LIGHT_SOLID : LGP_LIGHT_CLOCKWISE;
+	return lgp_hw_light(d, light);
+}
+
+/* Follows a capture start or stop while the light is automatic. */
+static void lgp_follow_capture(struct lgp *d)
+{
+	int ret;
+
+	if (v4l2_ctrl_g_ctrl(d->light) != LGP_LIGHT_AUTO)
+		return;
+	ret = lgp_show_light(d, LGP_LIGHT_AUTO);
+	if (ret)
+		dev_warn(&d->usb->dev, "Cannot set the button light: %d\n", ret);
+}
+
+static int lgp_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct lgp *d = container_of(ctrl->handler, struct lgp, controls);
+
+	/* Only the light control has these ops. */
+	return lgp_show_light(d, ctrl->val);
+}
+
+static const struct v4l2_ctrl_ops lgp_ctrl_ops = {
+	.s_ctrl = lgp_s_ctrl,
+};
+
+static const char * const lgp_light_menu[] = {
+	[LGP_LIGHT_AUTO] = "Automatic",
+	[LGP_LIGHT_CLOCKWISE] = "Clockwise",
+	[LGP_LIGHT_SOLID] = "Solid",
+	[LGP_LIGHT_FADE] = "Fade",
+	[LGP_LIGHT_FAST] = "Fast Clockwise",
+	NULL,
+};
+
+static const struct v4l2_ctrl_config lgp_light_control = {
+	.ops = &lgp_ctrl_ops,
+	.id = LGP_CID_LIGHT,
+	.name = "Button Light",
+	.type = V4L2_CTRL_TYPE_MENU,
+	.max = LGP_LIGHT_FAST,
+	.def = LGP_LIGHT_AUTO,
+	.qmenu = lgp_light_menu,
+	/* Writing the current value again restarts the animation. */
+	.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+};
+
 static void lgp_return_buffers(struct lgp *d, enum vb2_buffer_state state)
 {
 	struct lgp_buffer *buf;
@@ -164,6 +222,7 @@ static int lgp_start_streaming(struct vb2_queue *q, unsigned int count)
 		d->worker = NULL;
 		goto stop;
 	}
+	lgp_follow_capture(d);
 	return 0;
 stop:
 	lgp_hw_stop(d);
@@ -193,7 +252,11 @@ static void lgp_stop(struct lgp *d)
 
 static void lgp_stop_streaming(struct vb2_queue *q)
 {
-	lgp_stop(vb2_get_drv_priv(q));
+	struct lgp *d = vb2_get_drv_priv(q);
+
+	lgp_stop(d);
+	if (!READ_ONCE(d->disconnected))
+		lgp_follow_capture(d);
 }
 
 static const struct vb2_ops lgp_queue_ops = {
@@ -454,6 +517,7 @@ static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	}
 	d->usb = usb_get_dev(interface_to_usbdev(intf));
 	mutex_init(&d->lock);
+	mutex_init(&d->io_lock);
 	spin_lock_init(&d->buffers_lock);
 	INIT_LIST_HEAD(&d->buffers);
 	d->width = 1280;
@@ -476,11 +540,12 @@ static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	ret = v4l2_device_register(&intf->dev, &d->v4l2);
 	if (ret)
 		goto release_queue;
-	v4l2_ctrl_handler_init(&d->controls, 1);
+	v4l2_ctrl_handler_init(&d->controls, 2);
 	/* Controls take their own mutex inside ioctls already holding d->lock. */
 	d->quality = v4l2_ctrl_new_std(&d->controls, NULL,
 				       V4L2_CID_JPEG_COMPRESSION_QUALITY,
 				       1, 100, 1, 75);
+	d->light = v4l2_ctrl_new_custom(&d->controls, &lgp_light_control, NULL);
 	if (d->controls.error) {
 		ret = d->controls.error;
 		goto put_v4l2;
@@ -502,6 +567,14 @@ static int lgp_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	usb_set_intfdata(intf, &d->v4l2);
 	dev_info(&intf->dev, "Native MJPEG webcam registered as %s\n",
 		 video_device_node_name(&d->video));
+	/* The webcam is still useful without the button. */
+	ret = lgp_button_register(d, intf);
+	if (ret)
+		dev_warn(&intf->dev, "Button unavailable: %d\n", ret);
+	/* Replace a pattern left by a session that did not end cleanly. */
+	ret = lgp_show_light(d, LGP_LIGHT_AUTO);
+	if (ret)
+		dev_warn(&intf->dev, "Cannot reset the button light: %d\n", ret);
 	return 0;
 put_v4l2:
 	v4l2_device_put(&d->v4l2);
@@ -520,6 +593,8 @@ static void lgp_disconnect(struct usb_interface *intf)
 	struct v4l2_device *v4l2 = usb_get_intfdata(intf);
 	struct lgp *d = container_of(v4l2, struct lgp, v4l2);
 
+	/* Stops the button poll while transfers still work. */
+	lgp_button_unregister(d);
 	mutex_lock(&d->lock);
 	/* On driver unbind the USB device is still present. Finish in-flight
 	 * command/reply pairs and stop the encoder before disabling transfers.
@@ -528,6 +603,9 @@ static void lgp_disconnect(struct usb_interface *intf)
 	if (READ_ONCE(d->usb->state) == USB_STATE_NOTATTACHED)
 		WRITE_ONCE(d->disconnected, true);
 	lgp_stop(d);
+	/* Leave the power-on pattern behind, whatever the control selects. */
+	if (!READ_ONCE(d->disconnected))
+		lgp_hw_light(d, LGP_LIGHT_CLOCKWISE);
 	WRITE_ONCE(d->disconnected, true);
 	vb2_queue_error(&d->queue);
 	v4l2_device_disconnect(v4l2);
@@ -556,7 +634,7 @@ static struct usb_driver lgp_usb_driver = {
 };
 module_usb_driver(lgp_usb_driver);
 
-MODULE_DESCRIPTION("AVerMedia Live Gamer Portable Lite GL310 native MJPEG webcam");
+MODULE_DESCRIPTION("AVerMedia Live Gamer Portable Lite GL310 native MJPEG webcam, button and light");
 MODULE_AUTHOR("lgp-lite-linux-driver contributors");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1.0");

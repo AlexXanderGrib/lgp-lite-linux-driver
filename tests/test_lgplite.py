@@ -1,4 +1,5 @@
 """Regression tests for timing detection and firmware stream boundaries."""
+import contextlib
 import io
 import random
 import unittest
@@ -119,6 +120,24 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(dev.read_buffer(msg), packet)
         self.assertGreater(dev.hci.dma_read.call_count, 1)
         dev.complete_buffer.assert_called_once_with(msg, len(packet) // 4)
+
+    def test_recording_light_writes_mcu_led_pattern(self):
+        dev = Device.__new__(Device)
+        dev.hci = Mock()
+        dev.hci.reg_read.return_value = 1 << 13  # MCU ready
+        dev.show_recording(True)
+        dev.show_recording(False)
+        self.assertEqual([c.args for c in dev.hci.swi2c_write.call_args_list],
+                         [(0x15, bytes([0x2C, 5])), (0x15, bytes([0x2C, 4]))])
+
+    def test_recording_light_failure_is_not_raised(self):
+        dev = Device.__new__(Device)
+        dev.hci = Mock()
+        dev.hci.reg_read.return_value = 1 << 13
+        dev.hci.swi2c_write.side_effect = DeviceError("I2C write failed")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            dev.show_recording(True)
+        self.assertIn("button light", err.getvalue())
 
     def test_stop_timeout_does_not_leave_streaming_flag_set(self):
         dev = Device.__new__(Device)

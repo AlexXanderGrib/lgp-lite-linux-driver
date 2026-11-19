@@ -25,6 +25,7 @@
 #define OP_MEMORY 0x02
 #define OP_ARM_RUN 0x07
 #define OP_DMA 0x09
+#define OP_SWI2C_WRITE 0x0b
 #define OP_SWI2C_READ 0x0c
 
 #define I2C_OK 0x08
@@ -36,6 +37,8 @@
 #define MCU_STATUS_SYNC BIT(2)
 #define MCU_TIMING 0x1d
 #define MCU_POLARITY 0x26
+#define MCU_EVENT 0x2b		/* reading it dequeues the oldest event */
+#define MCU_LED 0x2c		/* write-only light ring pattern */
 
 /* SoC registers (byte addresses). */
 #define REG_CONTROL 0x000
@@ -43,6 +46,7 @@
 #define REG_GPIO_DIRECTION 0x610
 #define REG_GPIO_VALUE 0x614
 #define REG_GPIO_INPUT 0x618
+#define GPIO_MCU_EVENT BIT(12)	/* low while MCU events are queued */
 #define GPIO_MCU_READY BIT(13)
 #define REG_HOST_MESSAGE 0x6b0	/* ARM to host: code, five parameters, status */
 #define REG_HOST_STATUS 0x6c8
@@ -106,16 +110,23 @@ static int lgp_drain(struct lgp *d, unsigned int ep, unsigned int size)
 	unsigned long deadline = jiffies + msecs_to_jiffies(500);
 	int actual, ret;
 
+	/* Hold io_lock so that a button poll cannot lose its reply here. */
+	mutex_lock(&d->io_lock);
 	do {
 		actual = 0;
 		ret = usb_bulk_msg(d->usb, usb_rcvbulkpipe(d->usb, ep),
 				   d->dma, size, &actual, 20);
 		if (ret && ret != -ETIMEDOUT)
-			return ret;
-		if (ret == -ETIMEDOUT && !actual)
-			return 0;
+			goto out;
+		if (ret == -ETIMEDOUT && !actual) {
+			ret = 0;
+			goto out;
+		}
 	} while (time_before(jiffies, deadline));
-	return -ETIMEDOUT;
+	ret = -ETIMEDOUT;
+out:
+	mutex_unlock(&d->io_lock);
+	return ret;
 }
 
 static int lgp_bulk(struct lgp *d, bool in, unsigned int ep, void *data, int len)
@@ -132,42 +143,71 @@ static int lgp_bulk(struct lgp *d, bool in, unsigned int ep, void *data, int len
 	return actual == len ? 0 : -EIO;
 }
 
-/* Commands are `u8 opcode, u8 flag, le16 count, le32 address, le32 params[]`. */
-static int lgp_command(struct lgp *d, u8 op, u8 flag, u16 count, u32 addr,
-		       const u32 *params, unsigned int nparams, unsigned int reply)
+/* Fills d->command: `u8 opcode, u8 flag, le16 count, le32 address,
+ * le32 params[]`, and returns its length.
+ */
+static unsigned int lgp_pack(struct lgp *d, u8 op, u8 flag, u16 count,
+			     u32 addr, const u32 *params, unsigned int nparams)
 {
 	unsigned int i;
-	int ret;
 
-	if (WARN_ON(8 + nparams * 4 > LGP_COMMAND_SIZE || reply > LGP_COMMAND_SIZE))
-		return -EINVAL;
 	d->command[0] = op;
 	d->command[1] = flag;
 	put_unaligned_le16(count, d->command + 2);
 	put_unaligned_le32(addr, d->command + 4);
 	for (i = 0; i < nparams; i++)
 		put_unaligned_le32(params[i], d->command + 8 + i * 4);
-	ret = lgp_bulk(d, false, EP_COMMAND, d->command, 8 + nparams * 4);
+	return 8 + nparams * 4;
+}
+
+/* Sends d->command and reads `reply` bytes into d->reply. The caller holds
+ * io_lock, which keeps each command together with its reply.
+ */
+static int lgp_transfer(struct lgp *d, unsigned int length, unsigned int reply)
+{
+	int ret;
+
+	lockdep_assert_held(&d->io_lock);
+	ret = lgp_bulk(d, false, EP_COMMAND, d->command, length);
 	if (!ret && reply)
 		ret = lgp_bulk(d, true, EP_REPLY, d->reply, reply);
 	return ret;
 }
 
+static int lgp_command(struct lgp *d, u8 op, u8 flag, u16 count, u32 addr,
+		       const u32 *params, unsigned int nparams,
+		       void *reply, unsigned int reply_length)
+{
+	int ret;
+
+	if (WARN_ON(8 + nparams * 4 > LGP_COMMAND_SIZE ||
+		    reply_length > LGP_COMMAND_SIZE))
+		return -EINVAL;
+	mutex_lock(&d->io_lock);
+	ret = lgp_transfer(d, lgp_pack(d, op, flag, count, addr, params, nparams),
+			   reply_length);
+	if (!ret && reply_length)
+		memcpy(reply, d->reply, reply_length);
+	mutex_unlock(&d->io_lock);
+	return ret;
+}
+
 static int lgp_read_regs(struct lgp *d, u32 addr, u32 *values, unsigned int n)
 {
+	u8 raw[LGP_COMMAND_SIZE];
 	unsigned int i;
-	int ret = lgp_command(d, OP_REGISTER, 0, n, addr, NULL, 0, n * 4);
+	int ret = lgp_command(d, OP_REGISTER, 0, n, addr, NULL, 0, raw, n * 4);
 
 	if (ret)
 		return ret;
 	for (i = 0; i < n; i++)
-		values[i] = get_unaligned_le32(d->reply + i * 4);
+		values[i] = get_unaligned_le32(raw + i * 4);
 	return 0;
 }
 
 static int lgp_write(struct lgp *d, u32 addr, u32 value)
 {
-	return lgp_command(d, OP_REGISTER, 1, 1, addr, &value, 1, 0);
+	return lgp_command(d, OP_REGISTER, 1, 1, addr, &value, 1, NULL, 0);
 }
 
 static int lgp_write_table(struct lgp *d, const struct lgp_reg *regs,
@@ -198,26 +238,33 @@ static int lgp_memory_write(struct lgp *d, u32 addr, u32 value)
 {
 	u32 p[] = { addr >> 2, value };
 
-	return lgp_command(d, OP_MEMORY, 1, 4, addr >> 2, p, ARRAY_SIZE(p), 0);
+	return lgp_command(d, OP_MEMORY, 1, 4, addr >> 2, p, ARRAY_SIZE(p),
+			   NULL, 0);
 }
 
 /* Transfers `length` bytes between SoC memory and d->dma. The device takes
  * word addresses and counts; `addr` and `length` are multiples of four.
+ * Only the thread that runs the encoder uses d->dma.
  */
 static int lgp_dma(struct lgp *d, bool write, u32 addr, unsigned int length)
 {
 	u32 p[] = { addr >> 2, length >> 2 };
 	int ret;
 
-	ret = lgp_command(d, OP_DMA, write, 8, 0, p, ARRAY_SIZE(p), 1);
-	if (ret)
-		return ret;
-	return lgp_bulk(d, !write, write ? EP_DMA_OUT : EP_DMA_IN, d->dma, length);
+	mutex_lock(&d->io_lock);
+	/* The device answers with one byte, then moves the payload. */
+	ret = lgp_transfer(d, lgp_pack(d, OP_DMA, write, 8, 0, p, ARRAY_SIZE(p)),
+			   1);
+	if (!ret)
+		ret = lgp_bulk(d, !write, write ? EP_DMA_OUT : EP_DMA_IN,
+			       d->dma, length);
+	mutex_unlock(&d->io_lock);
+	return ret;
 }
 
 static int lgp_arm(struct lgp *d, bool run)
 {
-	int ret = lgp_command(d, OP_ARM_RUN, run, 0, 0, NULL, 0, 0);
+	int ret = lgp_command(d, OP_ARM_RUN, run, 0, 0, NULL, 0, NULL, 0);
 
 	if (ret)
 		return ret;
@@ -296,37 +343,91 @@ static int lgp_return_buffer(struct lgp *d, const u32 *m, u32 words)
 			ARRAY_SIZE(p), m[6]);
 }
 
-/* Reads board MCU registers over the SoC's software I2C bus. */
-static int lgp_mcu(struct lgp *d, u8 reg, u8 *values, unsigned int length)
+/* Like the vendor driver, gives a busy MCU three chances, then tries. */
+static int lgp_mcu_wait(struct lgp *d)
 {
 	u32 gpio;
 	unsigned int i;
 	int ret;
 
-	/* Like the vendor driver, give a busy MCU three chances, then try. */
 	for (i = 0; i < 3; i++) {
 		ret = lgp_read_regs(d, REG_GPIO_INPUT, &gpio, 1);
-		if (ret)
+		if (ret || (gpio & GPIO_MCU_READY))
 			return ret;
-		if (gpio & GPIO_MCU_READY)
-			break;
 		msleep(30);
 	}
-	d->command[0] = OP_SWI2C_READ;
-	d->command[1] = 1;
-	put_unaligned_le16(length, d->command + 2);
-	put_unaligned_le32(MCU_ADDRESS, d->command + 4);
-	d->command[8] = reg;
-	ret = lgp_bulk(d, false, EP_COMMAND, d->command, 9);
-	if (ret)
-		return ret;
-	ret = lgp_bulk(d, true, EP_REPLY, d->reply, length + 1);
-	if (ret)
-		return ret;
-	if (d->reply[length] != I2C_OK)
-		return -EIO;
-	memcpy(values, d->reply, length);
 	return 0;
+}
+
+/* Reads board MCU registers over the SoC's software I2C bus. */
+static int lgp_mcu(struct lgp *d, u8 reg, u8 *values, unsigned int length)
+{
+	int ret = lgp_mcu_wait(d);
+
+	if (ret)
+		return ret;
+	mutex_lock(&d->io_lock);
+	/* Flag 1: write one byte, the register number, then read. */
+	lgp_pack(d, OP_SWI2C_READ, 1, length, MCU_ADDRESS, NULL, 0);
+	d->command[8] = reg;
+	ret = lgp_transfer(d, 9, length + 1);
+	if (!ret && d->reply[length] != I2C_OK)
+		ret = -EIO;
+	if (!ret)
+		memcpy(values, d->reply, length);
+	mutex_unlock(&d->io_lock);
+	return ret;
+}
+
+static int lgp_mcu_write(struct lgp *d, u8 reg, u8 value)
+{
+	int ret = lgp_mcu_wait(d);
+
+	if (ret)
+		return ret;
+	mutex_lock(&d->io_lock);
+	lgp_pack(d, OP_SWI2C_WRITE, 1, 2, MCU_ADDRESS, NULL, 0);
+	d->command[8] = reg;
+	d->command[9] = value;
+	ret = lgp_transfer(d, 10, 1);
+	if (!ret && d->reply[0] != I2C_OK)
+		ret = -EIO;
+	mutex_unlock(&d->io_lock);
+	return ret;
+}
+
+/* Shows a pattern on the light ring around the button. */
+int lgp_hw_light(struct lgp *d, enum lgp_light light)
+{
+	static const u8 patterns[] = {
+		[LGP_LIGHT_CLOCKWISE] = 4,
+		[LGP_LIGHT_SOLID] = 5,
+		[LGP_LIGHT_FADE] = 3,
+		[LGP_LIGHT_FAST] = 0x0b,
+	};
+
+	if (WARN_ON(light == LGP_LIGHT_AUTO || light >= ARRAY_SIZE(patterns)))
+		return -EINVAL;
+	return lgp_mcu_write(d, MCU_LED, patterns[light]);
+}
+
+/* Returns the oldest queued board MCU event, 0 if there is none, or an errno.
+ * GPIO 12 is low while the MCU has events queued, and reading the event
+ * register takes the oldest one off the queue.
+ */
+int lgp_hw_event(struct lgp *d)
+{
+	u32 gpio;
+	u8 event;
+	int ret;
+
+	ret = lgp_read_regs(d, REG_GPIO_INPUT, &gpio, 1);
+	if (ret || (gpio & GPIO_MCU_EVENT))
+		return ret;
+	/* The vendor driver waits 5 ms before reading the event. */
+	usleep_range(5000, 6000);
+	ret = lgp_mcu(d, MCU_EVENT, &event, 1);
+	return ret ? ret : event;
 }
 
 struct lgp_mode {
