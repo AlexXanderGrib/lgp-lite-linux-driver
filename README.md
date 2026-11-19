@@ -8,6 +8,11 @@ Linux drivers for the **AVerMedia Live Gamer Portable Lite (GL310)**, USB ID
 - **Native V4L2 webcam.** The `lgplite` kernel module exposes the card's
   hardware MJPEG encoder as an ordinary `/dev/video*` device for OBS, browsers,
   Discord, FFmpeg and other camera applications.
+- **Programmable button.** The kernel module also reports the button on top
+  of the card as a key, for a desktop shortcut or the included helper that
+  runs a command on each click. The light around it turns solid while the
+  card records, as with the vendor software, and can be set to other
+  patterns.
 - **Standalone recorder.** A dependency-free Python tool records the hardware
   encoder's MPEG-TS stream (H.264 video, AAC audio) through usbfs, with no
   kernel module.
@@ -75,6 +80,79 @@ audio is not implemented. Only one application can stream from the card at a
 time. Video device numbers can change after reconnecting, so select the card
 by name.
 
+### Button and light
+
+The Windows software uses the button on top of the card to launch itself. The
+module reports it as a key, `KEY_RECORD` (keysym `XF86AudioRecord`), on an
+input device named **AVerMedia GL310 Button**, whether or not anything is
+streaming. The card reports clicks only: there is no release, a long hold
+reports nothing, and the second press of a double click is usually lost. The
+driver polls the button every 125 ms while a program has the input device
+open; desktop sessions keep it open.
+
+To bind it in GNOME, open Settings → Keyboard → View and Customize Shortcuts →
+Custom Shortcuts, add a shortcut with your command, and press the button when
+asked for the shortcut. Other desktops and applications that accept hotkeys
+work the same way.
+
+The light ring around the button follows the **Button Light** control of the
+video device. Its default, Automatic, runs the LEDs clockwise while the card
+is idle and lights the ring solid while an application captures from it. The
+other values select one pattern: Clockwise, Solid, Fade or Fast Clockwise.
+Writing a value restarts its animation. The standalone recorder also lights
+the ring solid while it records.
+
+```sh
+v4l2-ctl -d /dev/video0 --set-ctrl=button_light=2   # solid
+v4l2-ctl -d /dev/video0 --set-ctrl=button_light=0   # automatic
+```
+
+`userspace/lgplite-button.py` runs a command for each click without a desktop
+shortcut, and answers each click with about two turns of Fast Clockwise
+before the light returns to its previous pattern (`--no-light` turns this
+off). It needs read access to the input device. This udev rule grants that,
+and the recorder's USB access, to the user at the local desktop; reconnect
+the card after installing it:
+
+```sh
+sudo install -m 0644 udev/70-avermedia-lgp-lite.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+```
+
+```sh
+python3 userspace/lgplite-button.py               # print each click
+python3 userspace/lgplite-button.py --click obs   # start OBS
+```
+
+The helper waits while the card is unplugged. To start it with the desktop
+session, create `~/.config/systemd/user/lgplite-button.service`, replacing
+the path and command:
+
+```ini
+[Unit]
+Description=Live Gamer Portable Lite button
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/lgp-lite-linux-driver/userspace/lgplite-button.py --click obs
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+```sh
+systemctl --user enable --now lgplite-button.service
+```
+
+To report a different key, map the button's scancode 0 in a udev hwdb file
+such as `/etc/udev/hwdb.d/70-lgplite-button.hwdb`, then run
+`sudo systemd-hwdb update` and reconnect the card:
+
+```
+evdev:name:AVerMedia GL310 Button:*
+ KEYBOARD_KEY_0=prog1
+```
+
 ### Secure Boot
 
 With Secure Boot enabled the kernel only loads signed modules. DKMS signs
@@ -120,7 +198,7 @@ The kernel module owns the USB interface while it is loaded. To use the
 recorder, close camera applications and run `sudo modprobe -r lgplite`;
 `sudo modprobe lgplite` restores the webcam afterwards.
 
-Install the USB access rule once, then unplug and reconnect the card:
+Install the access rule once, then unplug and reconnect the card:
 
 ```sh
 sudo install -m 0644 udev/70-avermedia-lgp-lite.rules /etc/udev/rules.d/
@@ -175,6 +253,8 @@ firmware in `firmware/`, in the directory given by `--firmware DIR` or
   inconsistent at those rates.
 - No HDMI audio in the native driver. MCU firmware updates and flash writes
   are not implemented.
+- The button reports clicks only: no release, no long press, and usually no
+  second press of a double click.
 - Timestamps follow the encoder's clock, anchored to the host clock when
   capture starts. The two clocks can drift apart in very long sessions.
 
@@ -205,7 +285,7 @@ development (`reg ADDRESS VALUE`); normal capture needs none.
 
 ```sh
 make -C kernel                          # build the module in place
-python3 -m unittest discover -s tests   # recorder unit tests, no hardware
+python3 -m unittest discover -s tests   # userspace unit tests, no hardware
 ```
 
 The protocol and how it was established are documented in

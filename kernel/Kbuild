@@ -1,2 +1,2 @@
 obj-m := lgplite.o
-lgplite-y := lgplite-video.o lgplite-hw.o
+lgplite-y := lgplite-video.o lgplite-hw.o lgplite-button.o

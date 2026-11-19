@@ -69,8 +69,10 @@ for dimensions in "${sizes[@]}"; do
         test "$(grep '^frame=' "$results/$name-live-${fps}fps-progress.txt" | tail -n 1)" = frame=60
     done
 done
-# Leave the driver's default format selected.
+# Leave the driver's default format and automatic light selected; the
+# compliance test sets every control value.
 v4l2-ctl -d "$device" \
-    --set-fmt-video=width=1280,height=720,pixelformat=MJPG --set-parm=30
+    --set-fmt-video=width=1280,height=720,pixelformat=MJPG --set-parm=30 \
+    --set-ctrl=button_light=0
 echo "Capture checks completed; compliance status=$status. Results: $results"
 exit "$status"

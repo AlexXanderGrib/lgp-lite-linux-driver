@@ -52,6 +52,36 @@ development and the module bound each time.
 - The scaler stretches the picture to the requested size. 640×480 distorted a
   16:9 source, so the driver advertises 16:9 sizes only.
 
+## Button and light, 2026-11-19
+
+Same card, kernel and Secure Boot setup. GNOME on Wayland held the input
+device open, so the driver polled the button throughout.
+
+| Check | Result |
+| --- | --- |
+| Single clicks while idle | Each reported once as `KEY_RECORD` |
+| Double click | One slow double click gave two events 0.27 s apart; fast double clicks gave one event, and most relaxed ones lost the second press |
+| Press held for three seconds | One event, the same as a short click |
+| Press held for eight seconds | No event |
+| Five clicks during a 1080p30 capture | All five reported; 2,700 frames captured and decoded, no FFmpeg warnings, timestamps strictly increasing |
+| `tools/validate-native.sh` while polling | 65 compliance checks passed, no warnings; every size and rate captured and decoded |
+| Driver unbind during capture | `tools/test-native-disconnect.py` passes; the button input device is removed and registered again |
+| Helper across rebinds | Waits while the device is absent and listens again once it returns |
+| Remapping through udev hwdb | `KEYBOARD_KEY_0=prog1` changed the key to `KEY_PROG1` |
+| Light while capturing | Solid during a 20-second 1080p30 capture, clockwise pattern again afterwards |
+| Light at driver load | A solid light set by hand returned to the clockwise pattern |
+| Light with the standalone recorder | Solid during a 15-second recording, clockwise pattern again afterwards; the recording decoded without errors |
+| Button Light control | Fade and Fast Clockwise shown through the control; Automatic followed capture start and stop. The other patterns were checked by writing the MCU register directly |
+| Helper light answer | Each click gave about two fast turns, then back to the clockwise pattern while idle and to solid during a 60-second capture; that capture had no FFmpeg warnings |
+| Module build | 6.2.0-23, 6.17.0-41 and 7.0.0-43 headers with `W=1`, no compiler warnings |
+
+Polling during capture adds one register read per 125 ms to the capture
+thread's continuous mailbox polling. With the HDMI source used that day,
+about 8% of the intervals between output frames were twice as long as
+expected, with or without the button code: three 900-frame runs per module
+had 67, 75 and 76 such intervals before the change and 71, 80 and 87 after.
+The 2026-11-16 checks above did not measure frame intervals.
+
 ## Standalone recorder, 2026-11-15
 
 ```sh
